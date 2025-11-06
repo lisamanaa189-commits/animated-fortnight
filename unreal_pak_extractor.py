@@ -44,8 +44,10 @@ class UnrealPakEntry:
 class UnrealPakExtractor:
     """Extracts files from Unreal Engine PAK archives."""
     
-    # Unreal PAK magic number (stored at end of file)
+    # Unreal PAK magic numbers (stored at end of file)
+    # Support multiple magic numbers for different PAK versions
     PAK_MAGIC = 0x5A6F12E1
+    PAK_MAGIC_ALTERNATIVE = 0xE1126F5A  # Byte-swapped version
     
     # Compression methods
     COMPRESS_None = 0x00
@@ -113,46 +115,109 @@ class UnrealPakExtractor:
                 print("File too small to be a valid PAK file")
                 return False
             
-            # Read footer (last 44 bytes for most versions)
-            f.seek(-44, 2)
-            footer_data = f.read(44)
+            # Try multiple footer formats
+            footer_formats = [
+                (-44, 44, True),   # Version 7+ with encryption info
+                (-28, 28, False),  # Older versions without encryption
+                (-220, 220, True), # Some newer versions with extended footer
+            ]
             
-            # Try to parse as PAK version 7+ footer
+            for seek_offset, read_size, has_encryption in footer_formats:
+                try:
+                    f.seek(seek_offset, 2)
+                    footer_data = f.read(read_size)
+                    
+                    if has_encryption and len(footer_data) >= 44:
+                        # Try parsing as version 7+ footer
+                        encryption_guid = footer_data[0:16]
+                        encrypted_index = struct.unpack('<B', footer_data[16:17])[0]
+                        
+                        # Try both little-endian and big-endian for magic
+                        for magic_offset in [17, 0]:
+                            if magic_offset + 4 > len(footer_data):
+                                continue
+                            
+                            # Try little-endian
+                            magic = struct.unpack('<I', footer_data[magic_offset:magic_offset+4])[0]
+                            if magic == self.PAK_MAGIC or magic == self.PAK_MAGIC_ALTERNATIVE:
+                                version_offset = magic_offset + 4
+                                if version_offset + 20 <= len(footer_data):
+                                    self.pak_version = struct.unpack('<I', footer_data[version_offset:version_offset+4])[0]
+                                    self.index_offset = struct.unpack('<Q', footer_data[version_offset+4:version_offset+12])[0]
+                                    self.index_size = struct.unpack('<Q', footer_data[version_offset+12:version_offset+20])[0]
+                                    self.encrypted = encrypted_index != 0
+                                    
+                                    if self.index_offset < file_size and self.index_size > 0:
+                                        return True
+                            
+                            # Try big-endian
+                            magic = struct.unpack('>I', footer_data[magic_offset:magic_offset+4])[0]
+                            if magic == self.PAK_MAGIC or magic == self.PAK_MAGIC_ALTERNATIVE:
+                                version_offset = magic_offset + 4
+                                if version_offset + 20 <= len(footer_data):
+                                    self.pak_version = struct.unpack('>I', footer_data[version_offset:version_offset+4])[0]
+                                    self.index_offset = struct.unpack('>Q', footer_data[version_offset+4:version_offset+12])[0]
+                                    self.index_size = struct.unpack('>Q', footer_data[version_offset+12:version_offset+20])[0]
+                                    self.encrypted = encrypted_index != 0
+                                    
+                                    if self.index_offset < file_size and self.index_size > 0:
+                                        return True
+                    
+                    elif not has_encryption and len(footer_data) >= 28:
+                        # Try parsing older format without encryption
+                        for magic_offset in [0, -4]:
+                            if magic_offset < 0:
+                                magic_offset = len(footer_data) + magic_offset
+                            if magic_offset + 4 > len(footer_data):
+                                continue
+                            
+                            # Try little-endian
+                            magic = struct.unpack('<I', footer_data[magic_offset:magic_offset+4])[0]
+                            if magic == self.PAK_MAGIC or magic == self.PAK_MAGIC_ALTERNATIVE:
+                                if magic_offset + 24 <= len(footer_data):
+                                    self.pak_version = struct.unpack('<I', footer_data[magic_offset+4:magic_offset+8])[0]
+                                    self.index_offset = struct.unpack('<Q', footer_data[magic_offset+8:magic_offset+16])[0]
+                                    self.index_size = struct.unpack('<Q', footer_data[magic_offset+16:magic_offset+24])[0]
+                                    self.encrypted = False
+                                    
+                                    if self.index_offset < file_size and self.index_size > 0:
+                                        return True
+                            
+                            # Try big-endian
+                            magic = struct.unpack('>I', footer_data[magic_offset:magic_offset+4])[0]
+                            if magic == self.PAK_MAGIC or magic == self.PAK_MAGIC_ALTERNATIVE:
+                                if magic_offset + 24 <= len(footer_data):
+                                    self.pak_version = struct.unpack('>I', footer_data[magic_offset+4:magic_offset+8])[0]
+                                    self.index_offset = struct.unpack('>Q', footer_data[magic_offset+8:magic_offset+16])[0]
+                                    self.index_size = struct.unpack('>Q', footer_data[magic_offset+16:magic_offset+24])[0]
+                                    self.encrypted = False
+                                    
+                                    if self.index_offset < file_size and self.index_size > 0:
+                                        return True
+                
+                except Exception as e:
+                    continue
+            
+            # If all formats failed, print the actual magic bytes for debugging
             try:
-                encryption_guid = footer_data[0:16]
-                encrypted_index = struct.unpack('<B', footer_data[16:17])[0]
-                magic = struct.unpack('<I', footer_data[17:21])[0]
+                f.seek(-44, 2)
+                footer_data = f.read(44)
+                print(f"\nDEBUG: Footer bytes (last 44):")
+                print(f"Hex: {footer_data.hex()}")
+                print(f"\nTrying to find magic in footer...")
                 
-                if magic != self.PAK_MAGIC:
-                    # Try older format (without encryption info)
-                    f.seek(-28, 2)
-                    footer_data = f.read(28)
-                    magic = struct.unpack('<I', footer_data[0:4])[0]
-                    
-                    if magic != self.PAK_MAGIC:
-                        print(f"Invalid PAK magic: {hex(magic)}, expected {hex(self.PAK_MAGIC)}")
-                        return False
-                    
-                    self.pak_version = struct.unpack('<I', footer_data[4:8])[0]
-                    self.index_offset = struct.unpack('<Q', footer_data[8:16])[0]
-                    self.index_size = struct.unpack('<Q', footer_data[16:24])[0]
-                    self.encrypted = False
-                else:
-                    self.pak_version = struct.unpack('<I', footer_data[21:25])[0]
-                    self.index_offset = struct.unpack('<Q', footer_data[25:33])[0]
-                    self.index_size = struct.unpack('<Q', footer_data[33:41])[0]
-                    self.encrypted = encrypted_index != 0
-                
-                # Validate values
-                if self.index_offset >= file_size or self.index_size == 0:
-                    print(f"Invalid index offset or size: offset={self.index_offset}, size={self.index_size}")
-                    return False
-                
-                return True
-                
-            except Exception as e:
-                print(f"Error parsing footer: {e}")
-                return False
+                # Search for magic number in the footer
+                for i in range(len(footer_data) - 3):
+                    magic_le = struct.unpack('<I', footer_data[i:i+4])[0]
+                    magic_be = struct.unpack('>I', footer_data[i:i+4])[0]
+                    if magic_le == self.PAK_MAGIC or magic_be == self.PAK_MAGIC:
+                        print(f"Found magic at offset {i}: {hex(magic_le)} (LE) / {hex(magic_be)} (BE)")
+            except:
+                pass
+            
+            print(f"\nFailed to parse PAK footer")
+            print(f"Expected magic: {hex(self.PAK_MAGIC)} or {hex(self.PAK_MAGIC_ALTERNATIVE)}")
+            return False
     
     def parse_index(self) -> bool:
         """Parse the PAK file index to extract file entries.
